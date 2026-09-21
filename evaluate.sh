@@ -1,0 +1,1 @@
+hyperfine ./calculate_average.sh 2>&1
