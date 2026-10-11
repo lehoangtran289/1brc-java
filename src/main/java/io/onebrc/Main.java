@@ -2,75 +2,57 @@ package io.onebrc;
 
 import java.io.IOException;
 import java.nio.file.Files;
-import java.nio.file.Paths;
+import java.nio.file.Path;
+import java.util.HashMap;
 import java.util.Map;
 import java.util.TreeMap;
-import java.util.stream.Collector;
-
-import static java.util.stream.Collectors.groupingBy;
+import java.util.stream.Stream;
 
 public class Main {
     private static final String FILE = "./data/measurements.txt";
 
-    private static record Measurement(String station, double value) {
-        private Measurement(String[] parts) {
-            this(parts[0], Double.parseDouble(parts[1]));
+    public static void main(String[] args) throws IOException {
+        // build hashmap to store measurements
+        Map<String, Stats> stats = new HashMap<>();
+
+        try (Stream<String> lines = Files.lines(Path.of(FILE))) {
+            lines.forEach(line -> {
+                String[] parts = line.split(";");
+                String station = parts[0];
+                double measurement = Double.parseDouble(parts[1]);
+
+                stats.computeIfAbsent(station, k -> new Stats()).add(measurement);
+            });
         }
+
+        // build result
+        Map<String, Stats> resultStats = new TreeMap<>(stats);
+        System.out.println(resultStats);
     }
 
-    private static record ResultRow(double min, double mean, double max) {
-
-        public String toString() {
-            return round(min) + "/" + round(mean) + "/" + round(max);
-        }
-
-        private double round(double value) {
-            return Math.round(value * 10.0) / 10.0;
-        }
-    };
-
-    private static class MeasurementAggregator {
+    public static class Stats {
+        private long count;
+        private double sum;
         private double min = Double.POSITIVE_INFINITY;
         private double max = Double.NEGATIVE_INFINITY;
-        private double sum;
-        private long count;
-    }
 
-    public static void main(String[] args) throws IOException {
-        // Map<String, Double> measurements1 = Files.lines(Paths.get(FILE))
-        // .map(l -> l.split(";"))
-        // .collect(groupingBy(m -> m[0], averagingDouble(m -> Double.parseDouble(m[1]))));
-        //
-        // measurements1 = new TreeMap<>(measurements1.entrySet()
-        // .stream()
-        // .collect(toMap(e -> e.getKey(), e -> Math.round(e.getValue() * 10.0) / 10.0)));
-        // System.out.println(measurements1);
+        public Stats() {
+        }
 
-        Collector<Measurement, MeasurementAggregator, ResultRow> collector = Collector.of(
-                MeasurementAggregator::new,
-                (a, m) -> {
-                    a.min = Math.min(a.min, m.value);
-                    a.max = Math.max(a.max, m.value);
-                    a.sum += m.value;
-                    a.count++;
-                },
-                (agg1, agg2) -> {
-                    var res = new MeasurementAggregator();
-                    res.min = Math.min(agg1.min, agg2.min);
-                    res.max = Math.max(agg1.max, agg2.max);
-                    res.sum = agg1.sum + agg2.sum;
-                    res.count = agg1.count + agg2.count;
+        public void add(double measurement) {
+            count++;
+            sum += measurement;
+            min = Math.min(min, measurement);
+            max = Math.max(max, measurement);
+        }
 
-                    return res;
-                },
-                agg -> {
-                    return new ResultRow(agg.min, (Math.round(agg.sum * 10.0) / 10.0) / agg.count, agg.max);
-                });
+        private static double round(double value) {
+            return Math.round(value * 10.0) / 10.0;
+        }
 
-        Map<String, ResultRow> measurements = new TreeMap<>(Files.lines(Paths.get(FILE))
-                .map(l -> new Measurement(l.split(";")))
-                .collect(groupingBy(m -> m.station(), collector)));
-
-        System.out.println(measurements);
+        @Override
+        public String toString() {
+            return round(min) + "/" + round(round(sum) / count) + "/" + round(max);
+        }
     }
 }
