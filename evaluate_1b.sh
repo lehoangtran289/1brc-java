@@ -1,0 +1,1 @@
+ln -sf measurements_1b.txt data/measurements.txt && mvn clean package && hyperfine --runs 2 ./calculate_average.sh 2>&1

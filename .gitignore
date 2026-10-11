@@ -70,8 +70,9 @@ nbactions.xml
 out/
 
 # 1BRC
-/measurements*.txt
 data/measurements*
+/stats*.txt
+data/stats*
 /*.out
 out_expected.txt
 /*-timing.json
