@@ -34,6 +34,8 @@ if [ "$#" -gt 1 ] || [ "${1:-}" = "-h" ]; then
   exit 1
 fi
 
+mvn clean package
+
 for sample in $(ls $INPUT); do
   echo "Validating calculate_average.sh -- $sample"
 

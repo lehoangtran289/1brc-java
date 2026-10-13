@@ -1,1 +1,1 @@
-ln -sf measurements_100M.txt data/measurements.txt && mvn clean package && hyperfine --runs 2 ./calculate_average.sh 2>&1
+ln -sf measurements_100M.txt data/measurements.txt && mvn clean package && hyperfine --warmup 1 --runs 3 ./calculate_average.sh 2>&1

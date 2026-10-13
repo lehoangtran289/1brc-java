@@ -15,5 +15,5 @@
 #  limitations under the License.
 #
 
-JAVA_OPTS=""
+JAVA_OPTS="--enable-preview"
 java $JAVA_OPTS --class-path target/1brc-java-1.0-SNAPSHOT.jar io.onebrc.Main
