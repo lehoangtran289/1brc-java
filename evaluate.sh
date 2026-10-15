@@ -1,1 +1,1 @@
-mvn clean package && hyperfine --runs 1 ./calculate_average.sh 2>&1
+mvn clean package && hyperfine --warmup 1 --runs 10 ./calculate_average.sh 2>&1
