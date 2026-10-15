@@ -3,6 +3,8 @@ package io.onebrc;
 import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
+import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
@@ -19,6 +21,15 @@ public class Main {
     private static final byte DOT = '.';
     private static final byte MINUS = '-';
 
+    // for checking ';' in 8 bytes
+    // x = word ^ SEMI_PATTERN -> ';' byte = 00
+    // hit = (x - 1) & ~x & HIGH_BITS
+    //      -> (x - 1) & ~x keeps ';' = FF -> & HIGH_BITS keeps high bit in only ';' byte -> position of ';'
+    private static final long SEMI_PATTERN = 0x3B3B3B3B3B3B3B3BL; // check ';' in 8 bytes
+    private static final long ONES = 0x0101010101010101L;
+    private static final long HIGH_BITS = 0x8080808080808080L;
+    private static final ValueLayout.OfLong LONG_LE = ValueLayout.JAVA_LONG_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
+
     public static void main(String[] args) throws IOException {
 //        long start = System.currentTimeMillis();
         process();
@@ -32,23 +43,40 @@ public class Main {
         // Read line by line from file using mmap
         try (FileChannel channel = FileChannel.open(Path.of(FILE), StandardOpenOption.READ)) {
             MemorySegment file = channel.map(FileChannel.MapMode.READ_ONLY, 0, channel.size(), Arena.global());
+
+            long fileSize = file.byteSize();
             long offset = 0;
-            byte[] nameBuffer = new byte[128]; // avoid create new String object every row
+            long[] words = new long[1 << 4]; // 128 bytes
 
-            while (offset < file.byteSize()) {
+            while (offset < fileSize) {
                 // 1. Parse station name
-                int nameLength = 0;
-                int keyHash = 0;
-                byte currentByte;
+                int wordsLength = 0;
+                long nameStart = offset;
+                long hash = 0, word, match;
 
-                while ((currentByte = file.get(JAVA_BYTE, offset++)) != SEMICOLON) {
-                    nameBuffer[nameLength++] = currentByte;
-                    keyHash = 31 * keyHash + currentByte; // internet reference
+                while (true) {
+                    word = readLong(file, fileSize, offset);   // read 8 bytes
+                    match = findSemicolon(word);        // check for ';'
+
+                    if (match != 0) break;              // ; found
+
+                    words[wordsLength++] = word;
+                    hash = addHash(hash, word);         // else accumulate hash
+                    offset += 8;                        // forward offset by 1 long
                 }
+                long nameBytes = getBytesBeforeSemicolon(word, match);
+                words[wordsLength++] = nameBytes;
+                hash = addHash(hash, nameBytes);
+                int keyHash = Long.hashCode(hash);
 
-                // 2. Parse temperature  ("-12.3" -> -123)
+                int semicolonIndex = getSemicolonIndex(match);
+                offset += semicolonIndex;
+                int nameLength = (int) (offset - nameStart);
+                offset++; // skip ';'
+
+                // 2. Parse temperature
                 int sign = 1;
-                currentByte = file.get(JAVA_BYTE, offset++); // first char
+                byte currentByte = file.get(JAVA_BYTE, offset++); // first char
                 if (currentByte == MINUS) {
                     sign = -1;
                     currentByte = file.get(JAVA_BYTE, offset++);
@@ -65,7 +93,7 @@ public class Main {
                 int measurement = sign * temp;
 
                 // 3. Update station stat
-                Entry currentEntry = stationTable.getOrInsert(nameBuffer, nameLength, keyHash);
+                Entry currentEntry = stationTable.getOrInsert(file, nameStart, nameLength, words, wordsLength, keyHash);
                 currentEntry.add(measurement);
             }
         }
@@ -80,6 +108,44 @@ public class Main {
         System.out.println(results);
     }
 
+    private static long readLong(MemorySegment file, long fileSize, long offset) {
+        if (offset + 7 < fileSize) { // read 8 bytes
+            return file.get(LONG_LE, offset);
+        }
+
+        long result = 0;
+        for (int i = 0; offset + i < fileSize; ++i) {
+            result |= (file.get(JAVA_BYTE, offset + i) & 0xFFL) << (8 * i);
+        }
+        return result;
+    }
+
+    /**
+     * match = 0x0000008000000000L
+     * (match ^ (match - 1) -> 0x0000007FFFFFFFFFL
+     * (match ^ (match - 1) >>> 8 -> mask = 0x00000000FFFFFFFFL
+     * Since little endian -> word & mask = station name part
+     */
+    private static long getBytesBeforeSemicolon(long word, long match) {
+        return word & ((match ^ (match - 1)) >>> 8);
+    }
+
+    /**
+     * Since little endian -> name station is LSB -> use trailing zeros to get index of ';'
+     */
+    private static int getSemicolonIndex(long match) {
+        return Long.numberOfTrailingZeros(match) >>> 3; // 0...7
+    }
+
+    private static long addHash(long hash, long word) {
+        return (hash ^ word) * 0x9E3779B97F4A7C15L; // internet reference
+    }
+
+    private static long findSemicolon(long word) {
+        long input = word ^ SEMI_PATTERN;
+        return (input - ONES) & ~input & HIGH_BITS;
+    }
+
     private static int toDigit(byte b) {
         return b - '0';
     }
@@ -92,22 +158,27 @@ public class Main {
         /**
          * hash ^ (hash >>> 16) to blend 16 MSB with 16 LSB, reduce collisions when & MASK.
          */
-        public Entry getOrInsert(byte[] buffer, int length, int hash) {
+        public Entry getOrInsert(MemorySegment file, long nameStart, int length, long[] words, int wordLength, int hash) {
             int index = (hash ^ (hash >>> 14)) & MASK; // internet reference
 
             while (true) {
                 Entry entry = entries[index];
 
-                if (entry == null) {
-                    entries[index] = new Entry(Arrays.copyOf(buffer, length), hash);
+                if (entry == null) { // new station (~400 times): copy name bytes + words only here
+                    entries[index] = new Entry(
+                            file.asSlice(nameStart, length).toArray(JAVA_BYTE),
+                            Arrays.copyOf(words, wordLength),
+                            hash
+                    );
                     return entries[index];
                 }
 
-                // check for collision (same index -> same hash, same bytes)
+                // check for collision (same index -> same hash, same words)
+                // word count must match first: wordsEqual reads wordLength words from both arrays
                 if (
                         entry.hash == hash
-                        && entry.nameBuffer.length == length
-                        && Arrays.equals(entry.nameBuffer, 0, length, buffer, 0, length)
+                        && entry.words.length == wordLength
+                        && wordsEqual(entry.words, words, wordLength)
                 ) {
                     return entry;
                 }
@@ -115,18 +186,26 @@ public class Main {
                 index = (index + 1) & MASK; // collision: try linear probing
             }
         }
+
+        private boolean wordsEqual(long[] words, long[] words1, int wordLength) {
+            for (int i = 0; i < wordLength; ++i)
+                if (words[i] != words1[i]) return false;
+            return true;
+        }
     }
 
     public static class Entry {
-        final byte[] nameBuffer;
+        final byte[] nameBuffer; // only used for printing, copied once when the station is first seen
+        final long[] words;      // only used for comparing
         final int hash;
         long count;
         long sum;
         int min = INF;
         int max = -INF;
 
-        public Entry(byte[] nameBuffer, int hash) {
+        public Entry(byte[] nameBuffer, long[] words, int hash) {
             this.nameBuffer = nameBuffer;
+            this.words = words;
             this.hash = hash;
         }
 
