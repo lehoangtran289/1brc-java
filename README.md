@@ -2,6 +2,14 @@
 
 My solution to the [One Billion Row Challenge](https://github.com/gunnarmorling/1brc), which reads a file of weather station stats (`<station>;<temperature>` per line) and computes the min/mean/max temperature per station as fast as possible.
 
+**Result:**
+
+- 100M rows (1.4 GB): 0.5s
+- 1B rows (14 GB): 13.5s
+- Setup: Apple M1 Pro (8 cores: 6 performance + 2 efficiency, 16 GB RAM), OpenJDK 21 (Temurin)
+- Write-up: [writeup/writeup.md](writeup/writeup.md), the pass-by-pass optimization log
+- Solution: [Main.java](src/main/java/io/onebrc/Main.java)
+
 ## Data
 
 The text file contains temperature values for a range of weather stations. Each row is one measurement in the format `<string: station name>;<double: measurement>`, with the measurement value having exactly one fractional digit. The following shows ten rows as an example:
