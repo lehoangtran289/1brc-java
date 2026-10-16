@@ -40,45 +40,16 @@ public class Main {
             MemorySegment file = channel.map(FileChannel.MapMode.READ_ONLY, 0, channel.size(), Arena.global());
 
             long fileSize = file.byteSize();
-            long offset = 0;
-            long[] words = new long[1 << 4]; // 128 bytes
+            long safeEnd = fileSize - 128; // avoid bound check for every row
 
-            while (offset < fileSize) {
-                // 1. Parse station name
-                int wordsLength = 0;
-                long nameStart = offset;
-                long hash = 0, word, match;
+            // 1. Process lines before safeEnd, no bound checks needed
+            long tailOffsetStart = processFileRange(file, safeEnd, stationTable);
 
-                while (true) {
-                    word = readLong(file, fileSize, offset); // read 8 bytes
-                    match = findSemicolon(word); // check for ';'
-                    if (match != 0) break; // ; found
-
-                    words[wordsLength++] = word;
-                    hash ^= word; // else accumulate hash
-                    offset += 8;  // forward offset by 1 long
-                }
-                long nameBytes = getBytesBeforeSemicolon(word, match);
-                words[wordsLength++] = nameBytes;
-                words[wordsLength] = 0; // for 1-word station name
-
-                int keyHash = Long.hashCode(addHash(hash, nameBytes));
-
-                int semicolonIndex = getSemicolonIndex(match);
-                offset += semicolonIndex;
-                int nameLength = (int) (offset - nameStart);
-                offset++; // skip ';'
-
-                // 2. Parse temperature
-                long tempWord = readLong(file, fileSize, offset);
-                int dotPos = dotPos(tempWord);
-                int measurement = parseTemperature(tempWord, dotPos);
-                offset += (dotPos >>> 3) + 3;  // skip '.', fraction digit, '\n'
-
-                // 3. Update station stat
-                Entry currentEntry = stationTable.getOrInsert(file, nameStart, nameLength, words, wordsLength, keyHash);
-                currentEntry.add(measurement);
-            }
+            // 2. Process tail line (<= 128 bytes)
+            long tailLength = fileSize - tailOffsetStart;
+            MemorySegment tail = Arena.global().allocate(tailLength + 128); // zero-filled
+            MemorySegment.copy(file, tailOffsetStart, tail, 0, tailLength); // copy tail line to new segment
+            processFileRange(tail, tailLength, stationTable); // read last line on this new segment
         }
 
         // Print result sorted by key
@@ -91,23 +62,47 @@ public class Main {
         System.out.println(results);
     }
 
-    /**
-     * Read 8 bytes from segment at a time, return a long number representing these 8 bytes (little endian)
-     */
-    private static long readLong(MemorySegment file, long fileSize, long offset) {
-        // bound check
-        if (offset + 7 < fileSize) {
-            return file.get(LONG_LE, offset);
-        }
+    private static long processFileRange(MemorySegment file, long end, StationTable stationTable) {
+        long offset = 0;
+        long[] words = new long[1 << 4]; // 128 bytes
 
-        // read last (< 8) bytes
-        long result = 0;
-        for (int i = 0; offset + i < fileSize; ++i) {
-            // read byte by byte, & 0xFFL to cancel out negative
-            // << (8 * i) = little endian position in long
-            result |= (file.get(JAVA_BYTE, offset + i) & 0xFFL) << (8 * i);
+        while (offset < end) {
+            // 1. Parse station name
+            int wordsLength = 0;
+            long nameStart = offset;
+            long hash = 0, word, match;
+
+            while (true) {
+                word = file.get(LONG_LE, offset); // read 8 bytes
+                match = findSemicolon(word); // check for ';'
+                if (match != 0) break; // ; found
+
+                words[wordsLength++] = word;
+                hash ^= word; // else accumulate hash
+                offset += 8;  // forward offset by 1 long
+            }
+            long nameBytes = getBytesBeforeSemicolon(word, match);
+            words[wordsLength++] = nameBytes;
+            words[wordsLength] = 0; // for 1-word station name
+
+            int keyHash = Long.hashCode(addHash(hash, nameBytes));
+
+            int semicolonIndex = getSemicolonIndex(match);
+            offset += semicolonIndex;
+            int nameLength = (int) (offset - nameStart);
+            offset++; // skip ';'
+
+            // 2. Parse temperature
+            long tempWord = file.get(LONG_LE, offset);
+            int dotPos = dotPos(tempWord);
+            int measurement = parseTemperature(tempWord, dotPos);
+            offset += (dotPos >>> 3) + 3;  // skip '.', fraction digit, '\n'
+
+            // 3. Update station stat
+            Entry currentEntry = stationTable.getOrInsert(file, nameStart, nameLength, words, wordsLength, keyHash);
+            currentEntry.add(measurement);
         }
-        return result;
+        return offset;
     }
 
     /**
@@ -163,6 +158,8 @@ public class Main {
         // And apply the sign
         return (int) ((absValue + signed) ^ signed);
     }
+
+    // ---------------------------------------------------------------------------------------------------------------
 
     public static class StationTable {
         private static final int SIZE = 1 << 14; // init with 2^14 entries
