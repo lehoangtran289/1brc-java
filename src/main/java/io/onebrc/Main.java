@@ -17,11 +17,8 @@ import static java.lang.foreign.ValueLayout.JAVA_BYTE;
 public class Main {
     private static final String FILE = "./data/measurements.txt";
     private static final int INF = 1 << 30;
-    private static final byte SEMICOLON = ';';
-    private static final byte DOT = '.';
-    private static final byte MINUS = '-';
 
-    // for checking ';' in 8 bytes
+    // for checking index of ';' in a long (8 bytes)
     // x = word ^ SEMI_PATTERN -> ';' byte = 00
     // hit = (x - 1) & ~x & HIGH_BITS
     //      -> (x - 1) & ~x keeps ';' = FF -> & HIGH_BITS keeps high bit in only ';' byte -> position of ';'
@@ -31,9 +28,7 @@ public class Main {
     private static final ValueLayout.OfLong LONG_LE = ValueLayout.JAVA_LONG_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
 
     public static void main(String[] args) throws IOException {
-//        long start = System.currentTimeMillis();
         process();
-//        System.out.println("Took: " + (System.currentTimeMillis() - start) + " ms");
     }
 
     private static void process() throws IOException {
@@ -55,19 +50,19 @@ public class Main {
                 long hash = 0, word, match;
 
                 while (true) {
-                    word = readLong(file, fileSize, offset);   // read 8 bytes
-                    match = findSemicolon(word);        // check for ';'
-
-                    if (match != 0) break;              // ; found
+                    word = readLong(file, fileSize, offset); // read 8 bytes
+                    match = findSemicolon(word); // check for ';'
+                    if (match != 0) break; // ; found
 
                     words[wordsLength++] = word;
-                    hash = addHash(hash, word);         // else accumulate hash
-                    offset += 8;                        // forward offset by 1 long
+                    hash ^= word; // else accumulate hash
+                    offset += 8;  // forward offset by 1 long
                 }
                 long nameBytes = getBytesBeforeSemicolon(word, match);
                 words[wordsLength++] = nameBytes;
-                hash = addHash(hash, nameBytes);
-                int keyHash = Long.hashCode(hash);
+                words[wordsLength] = 0; // for 1-word station name
+
+                int keyHash = Long.hashCode(addHash(hash, nameBytes));
 
                 int semicolonIndex = getSemicolonIndex(match);
                 offset += semicolonIndex;
@@ -75,22 +70,10 @@ public class Main {
                 offset++; // skip ';'
 
                 // 2. Parse temperature
-                int sign = 1;
-                byte currentByte = file.get(JAVA_BYTE, offset++); // first char
-                if (currentByte == MINUS) {
-                    sign = -1;
-                    currentByte = file.get(JAVA_BYTE, offset++);
-                }
-                int temp = toDigit(currentByte); // first digit
-                currentByte = file.get(JAVA_BYTE, offset++);
-                if (currentByte != DOT) {
-                    temp = temp * 10 + toDigit(currentByte); // second digit
-                    offset++; // skip '.'
-                }
-                currentByte = file.get(JAVA_BYTE, offset);
-                temp = temp * 10 + toDigit(currentByte);
-                offset += 2;   // skip decimal digit & \n
-                int measurement = sign * temp;
+                long tempWord = readLong(file, fileSize, offset);
+                int dotPos = dotPos(tempWord);
+                int measurement = parseTemperature(tempWord, dotPos);
+                offset += (dotPos >>> 3) + 3;  // skip '.', fraction digit, '\n'
 
                 // 3. Update station stat
                 Entry currentEntry = stationTable.getOrInsert(file, nameStart, nameLength, words, wordsLength, keyHash);
@@ -108,13 +91,20 @@ public class Main {
         System.out.println(results);
     }
 
+    /**
+     * Read 8 bytes from segment at a time, return a long number representing these 8 bytes (little endian)
+     */
     private static long readLong(MemorySegment file, long fileSize, long offset) {
-        if (offset + 7 < fileSize) { // read 8 bytes
+        // bound check
+        if (offset + 7 < fileSize) {
             return file.get(LONG_LE, offset);
         }
 
+        // read last (< 8) bytes
         long result = 0;
         for (int i = 0; offset + i < fileSize; ++i) {
+            // read byte by byte, & 0xFFL to cancel out negative
+            // << (8 * i) = little endian position in long
             result |= (file.get(JAVA_BYTE, offset + i) & 0xFFL) << (8 * i);
         }
         return result;
@@ -146,8 +136,32 @@ public class Main {
         return (input - ONES) & ~input & HIGH_BITS;
     }
 
-    private static int toDigit(byte b) {
-        return b - '0';
+    private static final long MAGIC_MULTIPLIER = (100 * 0x1000000 + 10 * 0x10000 + 1);
+    private static final long DOT_BITS = 0x10101000;
+    // credit: merykitty
+    // The 4th binary digit of the ascii of a digit is 1 while
+    // that of the '.' is 0. This finds the decimal separator.
+    // The value can be 12, 20, 28
+    private static int dotPos(long word) {
+        return Long.numberOfTrailingZeros(~word & DOT_BITS);
+    }
+
+    // credit: merykitty and royvanrijn
+    private static int parseTemperature(long numberBytes, int dotPos) {
+        // numberBytes contains the number: X.X, -X.X, XX.X or -XX.X
+        final long invNumberBytes = ~numberBytes;
+
+        // Calculates the sign
+        final long signed = (invNumberBytes << 59) >> 63;
+        final int _28MinusDotPos = (dotPos ^ 0b11100);
+        final long minusFilter = ~(signed & 0xFF);
+        // Use the pre-calculated decimal position to adjust the values
+        final long digits = ((numberBytes & minusFilter) << _28MinusDotPos) & 0x0F000F0F00L;
+
+        // Multiply by a magic (100 * 0x1000000 + 10 * 0x10000 + 1), to get the result
+        final long absValue = ((digits * MAGIC_MULTIPLIER) >>> 32) & 0x3FF;
+        // And apply the sign
+        return (int) ((absValue + signed) ^ signed);
     }
 
     public static class StationTable {
@@ -168,7 +182,9 @@ public class Main {
                     entries[index] = new Entry(
                             file.asSlice(nameStart, length).toArray(JAVA_BYTE),
                             Arrays.copyOf(words, wordLength),
-                            hash
+                            hash,
+                            words[0],
+                            words[1]
                     );
                     return entries[index];
                 }
@@ -177,8 +193,9 @@ public class Main {
                 // word count must match first: wordsEqual reads wordLength words from both arrays
                 if (
                         entry.hash == hash
-                        && entry.words.length == wordLength
-                        && wordsEqual(entry.words, words, wordLength)
+                        && entry.word0 == words[0]
+                        && entry.word1 == words[1]
+                        && (wordLength <= 2 || wordTailEquals(entry.words, words, wordLength))
                 ) {
                     return entry;
                 }
@@ -187,26 +204,36 @@ public class Main {
             }
         }
 
-        private boolean wordsEqual(long[] words, long[] words1, int wordLength) {
-            for (int i = 0; i < wordLength; ++i)
+        private boolean wordTailEquals(long[] words, long[] words1, int wordLength) {
+            // bound check
+            if (words.length != wordLength) return false;
+
+            for (int i = 2; i < wordLength; ++i)
                 if (words[i] != words1[i]) return false;
             return true;
         }
     }
 
     public static class Entry {
+        // station name
         final byte[] nameBuffer; // only used for printing, copied once when the station is first seen
         final long[] words;      // only used for comparing
+        final long word0;
+        final long word1;
         final int hash;
+
+        // stats
         long count;
         long sum;
         int min = INF;
         int max = -INF;
 
-        public Entry(byte[] nameBuffer, long[] words, int hash) {
+        public Entry(byte[] nameBuffer, long[] words, int hash, long word0, long word1) {
             this.nameBuffer = nameBuffer;
             this.words = words;
             this.hash = hash;
+            this.word0 = word0;
+            this.word1 = word1;
         }
 
         public void add(int measurement) {
