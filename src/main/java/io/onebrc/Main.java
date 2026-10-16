@@ -11,12 +11,14 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.Arrays;
 import java.util.TreeMap;
+import java.util.stream.IntStream;
 
 import static java.lang.foreign.ValueLayout.JAVA_BYTE;
 
 public class Main {
     private static final String FILE = "./data/measurements.txt";
     private static final int INF = 1 << 30;
+    private static final int CHUNK_COUNT = Runtime.getRuntime().availableProcessors() * 16;
 
     // for checking index of ';' in a long (8 bytes)
     // x = word ^ SEMI_PATTERN -> ';' byte = 00
@@ -32,38 +34,73 @@ public class Main {
     }
 
     private static void process() throws IOException {
-        // Hashmap to store measurements
-        StationTable stationTable = new StationTable();
+        // One table per chunk: threads never share a table
+        StationTable[] stationTables = new StationTable[CHUNK_COUNT];
 
         // Read line by line from file using mmap
         try (FileChannel channel = FileChannel.open(Path.of(FILE), StandardOpenOption.READ)) {
             MemorySegment file = channel.map(FileChannel.MapMode.READ_ONLY, 0, channel.size(), Arena.global());
-
             long fileSize = file.byteSize();
-            long safeEnd = fileSize - 128; // avoid bound check for every row
 
-            // 1. Process lines before safeEnd, no bound checks needed
-            long tailOffsetStart = processFileRange(file, safeEnd, stationTable);
+            // 1. Lines starting before tailStart are read without bound checks
+            // tailStart = first line offset starts at fileSize - 128 (or 0 for files <= 128 bytes)
+            long tailStart = Math.max(fileSize - 128, 0);
+            while (tailStart > 0 && file.get(JAVA_BYTE, tailStart - 1) != '\n') tailStart++;
 
-            // 2. Process tail line (<= 128 bytes)
-            long tailLength = fileSize - tailOffsetStart;
+            // 2. Split [0, tailStart) into chunks, process each chunk simultaneously
+            long[] boundaries = splitFileIntoChunks(file, tailStart);
+
+            IntStream.range(0, CHUNK_COUNT)
+                    .parallel()
+                    .forEach(i -> {
+                        long start = (i == 0) ? 0 : boundaries[i - 1] + 1;
+                        stationTables[i] = new StationTable();
+                        processFileRange(file, start, boundaries[i] + 1, stationTables[i]);
+                    });
+
+            // 3. Process tail (<= 128 bytes) on a zero-padded copy, after all chunks are done
+            long tailLength = fileSize - tailStart;
             MemorySegment tail = Arena.global().allocate(tailLength + 128); // zero-filled
-            MemorySegment.copy(file, tailOffsetStart, tail, 0, tailLength); // copy tail line to new segment
-            processFileRange(tail, tailLength, stationTable); // read last line on this new segment
+            MemorySegment.copy(file, tailStart, tail, 0, tailLength); // copy tail lines to new segment
+            processFileRange(tail, 0, tailLength, stationTables[CHUNK_COUNT - 1]);
         }
 
-        // Print result sorted by key
-        TreeMap<String, String> results = new TreeMap<>();
-        for (Entry entry : stationTable.entries) {
-            if (entry == null) continue;
-            String stationName = new String(entry.nameBuffer, StandardCharsets.UTF_8);
-            results.put(stationName, entry.toString());
+        // 4. Merge chunk tables and print result sorted by key
+        TreeMap<String, Entry> results = new TreeMap<>();
+        for (StationTable stationTable : stationTables) {
+            for (Entry entry : stationTable.entries) {
+                if (entry == null) continue;
+                String stationName = new String(entry.nameBuffer, StandardCharsets.UTF_8);
+                results.merge(stationName, entry, Entry::merge);
+            }
         }
         System.out.println(results);
     }
 
-    private static long processFileRange(MemorySegment file, long end, StationTable stationTable) {
-        long offset = 0;
+    /**
+     * Split [0, end) into CHUNK_COUNT chunks. boundaries[i] = chunk[i]'s ending offset (a '\n')
+     */
+    private static long[] splitFileIntoChunks(MemorySegment file, long end) {
+        long[] boundaries = new long[CHUNK_COUNT];
+        long part = end / CHUNK_COUNT;
+
+        boundaries[CHUNK_COUNT - 1] = end - 1;
+        for (int i = CHUNK_COUNT - 2; i >= 0; --i) {
+            boundaries[i] = boundaries[i + 1] - part;
+
+            // move forward to the end of the line (-1 = nothing before the tail, small file)
+            while (boundaries[i] >= 0 && file.get(JAVA_BYTE, boundaries[i]) != '\n') {
+                boundaries[i]++;
+            }
+        }
+        return boundaries;
+    }
+
+    /**
+     * Process every line that starts in [start, end)
+     */
+    private static void processFileRange(MemorySegment file, long start, long end, StationTable stationTable) {
+        long offset = start;
         long[] words = new long[1 << 4]; // 128 bytes
 
         while (offset < end) {
@@ -102,7 +139,6 @@ public class Main {
             Entry currentEntry = stationTable.getOrInsert(file, nameStart, nameLength, words, wordsLength, keyHash);
             currentEntry.add(measurement);
         }
-        return offset;
     }
 
     /**
@@ -238,6 +274,14 @@ public class Main {
             sum += measurement;
             min = Math.min(min, measurement);
             max = Math.max(max, measurement);
+        }
+
+        public Entry merge(Entry other) {
+            count += other.count;
+            sum += other.sum;
+            min = Math.min(min, other.min);
+            max = Math.max(max, other.max);
+            return this;
         }
 
         private static double round(double value) {
